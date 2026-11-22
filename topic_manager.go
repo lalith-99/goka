@@ -195,8 +195,9 @@ func (m *topicManager) ensureExists(topic string, npar, rfactor int, config map[
 	}
 
 	// check additional config values via the cluster admin if our current version supports it
-	if m.adminSupported() {
-		cfgMap, err := m.getTopicConfigMap(topic)
+	clientConfig := m.client.Config()
+	if clientConfig.Version.IsAtLeast(sarama.V0_11_0_0) {
+		cfgMap, err := m.getTopicConfigMap(topic, clientConfig.Admin.Retry.Max, clientConfig.Admin.Retry.Backoff)
 		if err != nil {
 			return err
 		}
@@ -251,17 +252,19 @@ func (m *topicManager) waitForCreated(topic string) error {
 	return fmt.Errorf("waiting for topic %s to be created timed out", topic)
 }
 
-func (m *topicManager) adminSupported() bool {
-	return m.client.Config().Version.IsAtLeast(sarama.V0_11_0_0)
-}
-
-func (m *topicManager) getTopicConfigMap(topic string) (map[string]sarama.ConfigEntry, error) {
-	cfg, err := m.admin.DescribeConfig(sarama.ConfigResource{
-		Type: sarama.TopicResource,
-		Name: topic,
-	})
-
-	// now it does not exist anymore -- this means the cluster is somehow unstable
+func (m *topicManager) getTopicConfigMap(topic string, maxRetries int, backoff time.Duration) (map[string]sarama.ConfigEntry, error) {
+	resource := sarama.ConfigResource{Type: sarama.TopicResource, Name: topic}
+	cfg, err := m.admin.DescribeConfig(resource)
+	for attempt := 0; err != nil && attempt < maxRetries; attempt++ {
+		// Metadata can list a newly created topic before the broker serving
+		// DescribeConfigs knows about it.
+		var configErr *sarama.DescribeConfigError
+		if !errors.As(err, &configErr) || configErr.Err != sarama.ErrUnknownTopicOrPartition {
+			break
+		}
+		time.Sleep(backoff)
+		cfg, err = m.admin.DescribeConfig(resource)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("Error getting config for topic %s: %w", topic, err)
 	}

@@ -330,6 +330,49 @@ func TestTM_createTopic(t *testing.T) {
 	})
 }
 
+func TestTM_EnsureTopicExistsConfigPropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		code        sarama.KError
+		maxRetries  int
+		failures    int
+		wantSuccess bool
+	}{
+		{"visible on retry", sarama.ErrUnknownTopicOrPartition, 1, 1, true},
+		{"retry limit reached", sarama.ErrUnknownTopicOrPartition, 2, 3, false},
+		{"retries disabled", sarama.ErrUnknownTopicOrPartition, 0, 1, false},
+		{"permanent error", sarama.ErrTopicAuthorizationFailed, 2, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const topic = "new-topic"
+			tm, bm, ctrl := createTopicManager(t)
+			defer ctrl.Finish()
+			cfg := sarama.NewConfig()
+			cfg.Admin.Retry.Max = tc.maxRetries
+			cfg.Admin.Retry.Backoff = 0
+			bm.client.EXPECT().Config().Return(cfg)
+			bm.client.EXPECT().RefreshMetadata().Return(nil)
+			bm.client.EXPECT().Topics().Return([]string{topic}, nil)
+			bm.client.EXPECT().Partitions(topic).Return([]int32{0}, nil)
+			resource := sarama.ConfigResource{Type: sarama.TopicResource, Name: topic}
+			brokerErr := &sarama.DescribeConfigError{Err: tc.code}
+			failed := bm.admin.EXPECT().DescribeConfig(resource).Return(nil, brokerErr).Times(tc.failures)
+			if tc.wantSuccess {
+				bm.admin.EXPECT().DescribeConfig(resource).After(failed).Return(nil, nil)
+				bm.admin.EXPECT().DescribeTopics([]string{topic}).Return([]*sarama.TopicMetadata{
+					{Name: topic, Partitions: []*sarama.PartitionMetadata{{Replicas: []int32{0}}}},
+				}, nil)
+			}
+			err := tm.EnsureTopicExists(topic, 1, 1, nil)
+			if tc.wantSuccess {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, brokerErr)
+			}
+		})
+	}
+}
+
 func TestTM_EnsureTopicExists(t *testing.T) {
 	t.Run("exists_nocheck", func(t *testing.T) {
 		tm, bm, ctrl := createTopicManager(t)
